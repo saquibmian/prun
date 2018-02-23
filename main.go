@@ -2,27 +2,31 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"github.com/saquib.mian/prun/logwriter"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 )
 
 const (
-    version = "0.1"
+	version = "0.1"
 	runfile = "prun.json"
-    timeout = time.Minute * 30
+	timeout = time.Minute * 30
 )
 
 var (
-	failed    int32
-	processes sync.WaitGroup
+	maxconcurrency = 4
 )
+
+func init() {
+	flag.IntVar(&maxconcurrency, "n", 4, "number of commands to run at a time")
+	flag.Parse()
+}
 
 // Command is a representation of a program to run
 type Command struct {
@@ -30,10 +34,19 @@ type Command struct {
 	Args    []string
 }
 
+type CommandResult struct {
+	Success bool
+	Error   error
+}
+
+func (c *Command) String() string {
+	return fmt.Sprintf("'%s %s'", c.Command, strings.Join(c.Args, " "))
+}
+
 func main() {
-    fmt.Printf("prun v%s\n", version)
-    
-	additionalArgs := os.Args[1:]
+	fmt.Printf("prun v%s\n", version)
+
+	additionalArgs := flag.Args()
 
 	// get commands
 	var commands []Command
@@ -45,67 +58,88 @@ func main() {
 	defer file.Close()
 	json.NewDecoder(file).Decode(&commands)
 
-	// run all commands and wait
-	for i, command := range commands {
-		command.Args = append(command.Args, additionalArgs...)
-		processes.Add(1)
-		go runCommand(i+1, command)
-	}
-	processes.Wait()
+	input := make(chan Command)
+	output := make(chan CommandResult)
 
-	if failed > 0 {
-		fmt.Printf("error: %d command(s) failed\n", failed)
-		os.Exit(int(failed))
+	// start workers
+	for i := 1; i <= maxconcurrency; i++ {
+		go worker(i, input, output)
+	}
+
+	// publish all commands to run
+	go func() {
+		for _, cmd := range commands {
+			cmd.Args = append(cmd.Args, additionalArgs...)
+			input <- cmd
+		}
+		close(input)
+	}()
+
+	// wait for all commands to finish
+	numFailed := 0
+	for i := 0; i < len(commands); i++ {
+		result := <-output
+		if !result.Success {
+			numFailed++
+		}
+	}
+
+	if numFailed > 0 {
+		fmt.Printf("error: %d command(s) failed\n", numFailed)
+		os.Exit(numFailed)
 	}
 
 	os.Exit(0)
 }
 
-func runCommand(workerNumber int, command Command) {
-    defer processes.Done()
-    
-	stdout := log.New(os.Stdout, fmt.Sprintf("[%d] ", workerNumber), log.Ltime)
-	stderr := log.New(os.Stderr, fmt.Sprintf("[%d] ", workerNumber), log.Ltime)
+func worker(id int, input <-chan Command, output chan<- CommandResult) {
+	for cmd := range input {
+		stdout := log.New(os.Stdout, fmt.Sprintf("[%d] ", id), log.Ltime)
+		stderr := log.New(os.Stderr, fmt.Sprintf("[%d] ", id), log.Ltime)
 
+		stdout.Printf("--> %s\n", cmd.String())
+
+		stdoutWriter := logwriter.NewLogWriter(stdout)
+		stderrWriter := logwriter.NewLogWriter(stderr)
+		result := runCommand(stdoutWriter, stderrWriter, cmd)
+		stdoutWriter.Flush()
+		stderrWriter.Flush()
+
+		if !result.Success {
+			stderr.Printf("error: %s\n", result.Error.Error())
+		}
+
+		output <- result
+	}
+}
+
+func runCommand(stdout io.Writer, stderr io.Writer, command Command) CommandResult {
 	process := exec.Command(command.Command, command.Args...)
-	process.Stdout = logwriter.NewLogWriter(stdout)
-	process.Stderr = logwriter.NewLogWriter(stderr)
+	process.Stdout = stdout
+	process.Stderr = stderr
 
-	stdout.Printf("--> '%s %s'\n", command.Command, strings.Join(command.Args, " "))
+	if err := process.Start(); err != nil {
+		return CommandResult{Error: err}
+	}
 
+	timedOut := false
 	timer := time.NewTimer(timeout)
 	go func(timer *time.Timer, process *exec.Cmd) {
-        for _ = range timer.C {
-			err := process.Process.Signal(os.Kill)
-			if err := process.Wait(); err != nil {
-				if _, ok := err.(*exec.ExitError); ok {
-					stderr.Print("exited with non-zero exit code")
-				} else {
-					stderr.Printf("error: %s\n", err.Error())
-				}
-			}
-			stderr.Printf("error: process timed out %s", err.Error())
-            incrementFailed()
-            break
+		for _ = range timer.C {
+			process.Process.Signal(os.Kill)
+			timedOut = true
+			break
 		}
 	}(timer, process)
 
-	if err := process.Start(); err != nil {
-		stderr.Printf("error: %s\n", err.Error())
-		incrementFailed()
-	} else {
-		if err := process.Wait(); err != nil {
-			if _, ok := err.(*exec.ExitError); ok {
-				stderr.Print("exited with non-zero exit code")
-			} else {
-				stderr.Printf("error: %s\n", err.Error())
-			}
-			incrementFailed()
+	if err := process.Wait(); err != nil {
+		if timedOut {
+			err = fmt.Errorf("process timed out: %s", command.String())
+		} else if _, ok := err.(*exec.ExitError); ok {
+			err = fmt.Errorf("exited with non-zero exit code")
 		}
+		return CommandResult{Error: err}
 	}
-    stdout.Print("done")
-}
 
-func incrementFailed() {
-	atomic.AddInt32(&failed, 1)
+	return CommandResult{Success: true}
 }
